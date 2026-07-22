@@ -1,0 +1,29 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / cache
+.slide_tutor_data/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Conda
+*.egg-info/
+
+# Reference projects (large archives, not part of the source)
+参考项目/

@@ -1,0 +1,404 @@
+"""Data contract tests for Pydantic models.
+
+These catch LLM output format drift: if DeepSeek starts omitting fields or
+changing option keys, these tests fail BEFORE a user sees a broken quiz.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from slide_tutor.config import SCHEMA_VERSION
+from slide_tutor.models import (
+    AgentMessage,
+    AgentModelTurn,
+    AgentObservation,
+    AgentRunSummary,
+    AgentRoundTrace,
+    Citation,
+    LLMCallMetrics,
+    QAAnswerRecord,
+    QAContextBundle,
+    QuizAttempt,
+    QuizQuestion,
+    QuizResult,
+    QuizResultDetail,
+    QuizSet,
+    WeaknessItem,
+    WeaknessReport,
+)
+
+
+class TestAgentContracts:
+    def test_tool_message_requires_call_id_and_hides_absolute_path(self):
+        with pytest.raises(ValidationError):
+            AgentMessage(role="tool", content="observation")
+        with pytest.raises(ValidationError, match="absolute path"):
+            AgentMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="loaded /Users/example/private.pdf",
+            )
+
+    def test_system_and_user_cannot_carry_tool_calls(self):
+        with pytest.raises(ValidationError):
+            AgentMessage(
+                role="user",
+                content="question",
+                tool_calls=[{"call_id": "c", "name": "load_pages"}],
+            )
+
+    def test_finish_action_cannot_mix_with_read_calls(self):
+        with pytest.raises(ValidationError, match="mixed"):
+            AgentModelTurn(
+                tool_calls=[
+                    {"call_id": "c1", "name": "finish_answer"},
+                    {"call_id": "c2", "name": "load_pages"},
+                ],
+            )
+
+    def test_observation_error_requires_error_text(self):
+        with pytest.raises(ValidationError):
+            AgentObservation(call_id="c1", tool_name="load_pages", status="error")
+
+    def test_run_summary_usage_states_are_validated(self):
+        base = dict(
+            mode="bounded_agent_v2",
+            rounds=1,
+            executed_tool_calls=0,
+            baseline_source_count=1,
+            stop_reason="finish_requested",
+            elapsed_ms=1,
+        )
+        exact = AgentRunSummary(
+            **base,
+            usage_status="exact",
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        )
+        assert exact.total_tokens == 15
+        partial = AgentRunSummary(
+            **base,
+            usage_status="partial",
+            prompt_tokens=10,
+        )
+        assert partial.usage_status == "partial"
+        with pytest.raises(ValidationError):
+            AgentRunSummary(**base, usage_status="exact", prompt_tokens=10)
+        with pytest.raises(ValidationError):
+            AgentRunSummary(
+                **base,
+                usage_status="unavailable",
+                total_tokens=15,
+            )
+
+    def test_old_context_and_answer_records_load_without_agent_fields(self):
+        old_bundle = QAContextBundle.model_validate({
+            "prompt_context": "page text",
+            "sources": [],
+            "planner_mode": "function_calling",
+        })
+        assert old_bundle.agent_summary is None
+        record = QAAnswerRecord.model_validate({
+            "record_id": "r1",
+            "task_id": "t1",
+            "action_type": "ask",
+            "status": "completed",
+            "project_id": "p1",
+            "file_id": "f1",
+            "source_file": "lecture.pdf",
+            "page_number": 1,
+            "language": "中文",
+            "answer_markdown": "answer",
+            "created_at": "2026-07-16T00:00:00Z",
+            "context_bundle": old_bundle.model_dump(mode="json"),
+        })
+        assert record.context_bundle is not None
+        assert record.context_bundle.agent_summary is None
+
+    def test_round_trace_does_not_require_observation_body(self):
+        trace = AgentRoundTrace(round_number=1, elapsed_ms=3)
+        assert trace.observation_chars == 0
+        assert LLMCallMetrics(
+            operation="tool_calls",
+            model="planner",
+            status="success",
+            latency_ms=1,
+        ).total_tokens is None
+
+
+# ── QuizQuestion ──
+
+
+class TestQuizQuestion:
+    """Guard the most brittle contract: LLM-generated question dicts."""
+
+    def test_options_must_be_exactly_abcd(self):
+        """Reject dicts missing keys or with extra keys."""
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(_valid_question() | {"options": {"A": "x", "B": "y"}})
+
+    def test_correct_option_must_be_one_of_abcd(self):
+        """Reject correct_option outside A/B/C/D."""
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(_valid_question() | {"correct_option": "E"})
+
+    def test_auto_fills_question_id(self):
+        """question_id is generated by our code, not the LLM (D8).
+        Verify that a dict missing question_id still validates after the
+        pipeline's setdefault() logic."""
+        d = _valid_question()
+        del d["question_id"]
+        d.setdefault("question_id", "q-auto-1")  # simulates _validate_and_dedupe
+        q = QuizQuestion.model_validate(d)
+        assert q.question_id == "q-auto-1"
+
+    def test_accepts_valid_question(self):
+        """A fully valid dict should pass without exceptions."""
+        q = QuizQuestion.model_validate(_valid_question())
+        assert q.question_id == "q1"
+        assert q.correct_option == "B"
+
+    def test_question_type_is_required_for_new_questions(self):
+        d = _valid_question()
+        del d["question_type"]
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(d)
+
+    def test_accepts_true_false_question(self):
+        q = QuizQuestion.model_validate(_true_false_question())
+        assert q.question_type == "true_false"
+        assert q.correct_option == "A"
+
+    def test_fill_blank_requires_blank_answer(self):
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(_fill_blank_question(blank_answer=""))
+
+    def test_short_answer_requires_model_answer_and_rubric(self):
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(_short_answer_question(model_answer=""))
+        with pytest.raises(ValidationError):
+            QuizQuestion.model_validate(_short_answer_question(scoring_rubric=""))
+
+
+# ── QuizSet / QuizAttempt independence ──
+
+
+class TestQuizSetAttemptSeparation:
+    """D2: QuizSet is cacheable; QuizAttempt is per-user.  They must not
+    contaminate each other."""
+
+    def test_quiz_set_has_no_answer_data(self, valid_quiz_set):
+        dumped = valid_quiz_set.model_dump(mode="json")
+        assert "answers" not in dumped
+        assert "score" not in dumped
+
+    def test_quiz_attempt_has_answers(self, valid_quiz_set):
+        att = QuizAttempt(
+            attempt_id="att1",
+            quiz_set_id=valid_quiz_set.quiz_set_id,
+            project_id=valid_quiz_set.project_id,
+            file_ids=valid_quiz_set.file_ids,
+            total_count=valid_quiz_set.total_count,
+            answers={"q1": "A", "q2": "B"},
+        )
+        assert att.answers == {"q1": "A", "q2": "B"}
+
+    def test_quiz_set_serialization_round_trip(self, valid_quiz_set):
+        """QuizSet → JSON → back should survive without losing fields."""
+        dumped = valid_quiz_set.model_dump(mode="json")
+        reloaded = QuizSet.model_validate(dumped)
+        assert reloaded.quiz_set_id == valid_quiz_set.quiz_set_id
+        assert reloaded.question_type_mix == valid_quiz_set.question_type_mix
+        assert len(reloaded.questions) == len(valid_quiz_set.questions)
+        assert reloaded.questions[0].correct_option == "B"
+
+
+# ── Citation ──
+
+
+class TestCitation:
+    """Citations are the user's only audit trail back to source slides."""
+
+    def test_requires_source_file(self):
+        with pytest.raises(ValidationError):
+            Citation.model_validate({"page_number": 1, "snippet_reference": "..."})
+
+    def test_page_number_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            Citation.model_validate(
+                {"source_file": "L1.pdf", "page_number": 0, "snippet_reference": "..."}
+            )
+
+    def test_requires_snippet(self):
+        with pytest.raises(ValidationError):
+            Citation.model_validate({"source_file": "L1.pdf", "page_number": 1, "snippet_reference": ""})
+
+
+# ── WeaknessReport ──
+
+
+class TestWeaknessReport:
+    """D5: LLM-generated preferred, rule-based fallback.  Both must validate."""
+
+    def test_llm_generated_report(self):
+        wr = WeaknessReport(
+            weaknesses=[
+                WeaknessItem(
+                    topic="Linear Regression",
+                    error_count=2,
+                    question_ids=["q1", "q3"],
+                    diagnosis="You confused...",
+                    review_pages=[
+                        Citation(source_file="L1.pdf", page_number=8, snippet_reference="...")
+                    ],
+                )
+            ],
+            strengths=[],
+            generated_by="llm",
+        )
+        assert wr.generated_by == "llm"
+        assert len(wr.weaknesses) == 1
+
+    def test_rule_based_report(self):
+        wr = WeaknessReport(generated_by="rule")
+        assert wr.generated_by == "rule"
+        assert wr.weaknesses == []
+
+    def test_empty_report_for_perfect_score(self):
+        """All correct → no weaknesses, empty report is valid."""
+        wr = WeaknessReport(generated_by="llm")
+        assert wr.weaknesses == []
+        assert wr.strengths == []
+
+
+# ── Helpers ──
+
+
+def _valid_question(**overrides) -> dict:
+    """Minimal valid question dict — mirrors what the LLM should output."""
+    return {
+        "question_id": "q1",
+        "question_type": "mcq",
+        "topic_tag": "supervised learning",
+        "difficulty": "basic",
+        "question": "What is supervised learning?",
+        "options": {
+            "A": "Learning from unlabeled data",
+            "B": "Learning from labeled data",
+            "C": "Learning without data",
+            "D": "Learning from rewards",
+        },
+        "correct_option": "B",
+        "explanation": "Supervised learning uses labeled data.",
+        "distractor_rationales": {
+            "A": "Unsupervised learning uses unlabeled data.",
+            "C": "All ML needs data.",
+            "D": "Reinforcement learning uses rewards.",
+        },
+        "citations": [
+            {
+                "source_file": "Lecture01.pdf",
+                "page_number": 8,
+                "snippet_reference": "Supervised learning uses labeled data...",
+            }
+        ],
+    } | overrides
+
+
+def _true_false_question(**overrides) -> dict:
+    return {
+        "question_id": "tf1",
+        "question_type": "true_false",
+        "topic_tag": "classification",
+        "difficulty": "basic",
+        "question": "Classification predicts discrete labels.",
+        "options": {"A": "True", "B": "False"},
+        "correct_option": "A",
+        "explanation": "Classification outputs labels or classes.",
+        "distractor_rationales": {},
+        "citations": [
+            {
+                "source_file": "Lecture01.pdf",
+                "page_number": 8,
+                "snippet_reference": "Classification predicts classes...",
+            }
+        ],
+    } | overrides
+
+
+def _fill_blank_question(**overrides) -> dict:
+    return {
+        "question_id": "fill1",
+        "question_type": "fill_blank",
+        "topic_tag": "loss function",
+        "difficulty": "basic",
+        "question": "Fill in the blank: ____ measures prediction error.",
+        "options": {},
+        "correct_option": "",
+        "blank_answer": "loss",
+        "explanation": "A loss function measures prediction error.",
+        "distractor_rationales": {},
+        "citations": [
+            {
+                "source_file": "Lecture02.pdf",
+                "page_number": 4,
+                "snippet_reference": "Loss measures prediction error...",
+            }
+        ],
+    } | overrides
+
+
+def _short_answer_question(**overrides) -> dict:
+    return {
+        "question_id": "short1",
+        "question_type": "short_answer",
+        "topic_tag": "model evaluation",
+        "difficulty": "applied",
+        "question": "Explain why validation data is used.",
+        "options": {},
+        "correct_option": "",
+        "blank_answer": "",
+        "model_answer": "Validation data estimates generalization and supports model selection.",
+        "scoring_rubric": "3 points for generalization and model selection; partial credit for one idea.",
+        "explanation": "Validation data helps evaluate unseen performance.",
+        "distractor_rationales": {},
+        "citations": [
+            {
+                "source_file": "Lecture03.pdf",
+                "page_number": 12,
+                "snippet_reference": "Validation estimates generalization...",
+            }
+        ],
+    } | overrides
+
+
+@pytest.fixture
+def valid_quiz_set():
+    """A QuizSet with 2 questions — reusable across tests."""
+    qs = QuizSet(
+        quiz_set_id="test-cache-key-abc123",
+        project_id="test-project",
+        file_ids=["f1"],
+        total_count=2,
+        difficulty_mix="1 basic + 1 applied",
+        question_type_mix="mcq:2,true_false:0,fill_blank:0,short_answer:0",
+        questions=[
+            QuizQuestion.model_validate(_valid_question()),
+            QuizQuestion.model_validate(
+                _valid_question(
+                    question_id="q2",
+                    topic_tag="classification",
+                    difficulty="applied",
+                    question="Which of the following...?",
+                )
+            ),
+        ],
+        created_at="2026-07-06T00:00:00Z",
+        model="test-model",
+        prompt_version="v3",
+        language="中文",
+    )
+    return qs
