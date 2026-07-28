@@ -1194,7 +1194,12 @@ def _delete_answer_record(record_id: str) -> None:
     st.rerun()
 
 
-def _render_projected_record(record, *, label: str) -> None:
+def _answer_record_widget_key(surface: str, record_id: str) -> str:
+    """Namespace repeated history widgets without changing record identity."""
+    return f"delete-answer-{surface}-{record_id}"
+
+
+def _render_projected_record(record, *, label: str, key_scope: str) -> None:
     with st.expander(label, expanded=False):
         if record.question:
             st.markdown(f"**Q:** {record.question}")
@@ -1203,7 +1208,10 @@ def _render_projected_record(record, *, label: str) -> None:
         if record.error:
             st.error(record.error)
         _render_context_bundle(record.context_bundle)
-        if st.button("Delete answer", key=f"delete-answer-{record.record_id}"):
+        if st.button(
+            "Delete answer",
+            key=_answer_record_widget_key(key_scope, record.record_id),
+        ):
             _delete_answer_record(record.record_id)
 
 
@@ -1291,9 +1299,17 @@ def _render_answer_history(
         elif projection.scope == "whole_project":
             st.markdown(f"#### {group.source_file} · page {group.page_number}")
         if group.explain is not None:
-            _render_projected_record(group.explain, label="Explain · latest")
+            _render_projected_record(
+                group.explain,
+                label="Explain · latest",
+                key_scope="answer-history",
+            )
         for record in group.translations:
-            _render_projected_record(record, label=f"Translate · {record.language} · latest")
+            _render_projected_record(
+                record,
+                label=f"Translate · {record.language} · latest",
+                key_scope="answer-history",
+            )
         if group.asks:
             with st.expander(f"Ask · {len(group.asks)} question(s)", expanded=False):
                 for position, record in enumerate(group.asks, start=1):
@@ -1303,7 +1319,10 @@ def _render_answer_history(
                     st.markdown(f"**Q:** {record.question}")
                     st.markdown(record.answer_markdown)
                     _render_context_bundle(record.context_bundle)
-                    if st.button("Delete answer", key=f"delete-answer-{record.record_id}"):
+                    if st.button(
+                        "Delete answer",
+                        key=_answer_record_widget_key("answer-history", record.record_id),
+                    ):
                         _delete_answer_record(record.record_id)
         if group.recent_tasks:
             with st.expander(f"Recent task status · {len(group.recent_tasks)}", expanded=False):
@@ -1316,7 +1335,10 @@ def _render_answer_history(
                         st.markdown(record.answer_markdown)
                     if record.error:
                         st.error(record.error)
-                    if st.button("Delete record", key=f"delete-answer-{record.record_id}"):
+                    if st.button(
+                        "Delete record",
+                        key=_answer_record_widget_key("answer-history", record.record_id),
+                    ):
                         _delete_answer_record(record.record_id)
         if group.previous_versions:
             with st.expander(f"Previous versions · {len(group.previous_versions)}", expanded=False):
@@ -1326,7 +1348,10 @@ def _render_answer_history(
                         f"{record.created_at.replace('T', ' ')[:19]}"
                     )
                     st.markdown(record.answer_markdown)
-                    if st.button("Delete version", key=f"delete-answer-{record.record_id}"):
+                    if st.button(
+                        "Delete version",
+                        key=_answer_record_widget_key("answer-history", record.record_id),
+                    ):
                         _delete_answer_record(record.record_id)
 
 
@@ -1381,7 +1406,11 @@ def _render_project_history(project_id: str, *, busy: bool = False) -> None:
                 f"{timestamp} · {record.action_type.title()} · "
                 f"{record.source_file}, page {record.page_number}"
             )
-            _render_projected_record(record, label=label)
+            _render_projected_record(
+                record,
+                label=label,
+                key_scope="project-history",
+            )
 
 
 def _render_qa_panel(project_id: str, file: ProjectFile, slide: SlidePage) -> None:

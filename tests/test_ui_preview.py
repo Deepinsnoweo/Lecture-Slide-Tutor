@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from slide_tutor.ui import (
+    _answer_record_widget_key,
     _apply_page_jump,
     _agent_summary_text,
     _ensure_preview_preference_state,
@@ -114,6 +115,18 @@ def test_history_and_memory_section_is_conditional():
     assert _has_history_or_memory([], "project-a", [{"question": "Q"}])
     assert _has_history_or_memory([Record("project-a")], "project-a", [])
     assert not _has_history_or_memory([Record("project-b")], "project-a", [])
+
+
+def test_answer_history_widget_keys_are_namespaced_by_render_surface():
+    record_id = "task-shared-record"
+
+    local_key = _answer_record_widget_key("answer-history", record_id)
+    project_key = _answer_record_widget_key("project-history", record_id)
+
+    assert local_key != project_key
+    assert local_key.endswith(record_id)
+    assert project_key.endswith(record_id)
+    assert local_key == _answer_record_widget_key("answer-history", record_id)
 
 
 def test_quiz_surfaces_warn_when_only_baseline_is_active():
