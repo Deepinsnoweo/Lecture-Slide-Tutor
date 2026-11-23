@@ -95,61 +95,57 @@ All runtime data is stored under `.slide_tutor_data/projects/{project_id}/` and 
 
 ## Quick start
 
-### Requirements
-
-- Python 3.11
-- A modern browser
-- An OpenAI-compatible LLM endpoint, or a local Ollama model
-- PDF files containing material you are allowed to process
-
-The project was developed and tested on macOS. It should also run in another Python 3.11 environment when its native dependencies are available.
-
-### 1. Clone and install
-
-Using Conda:
+### 1. Install with Python 3.11
 
 ```bash
 git clone https://github.com/Deepinsnoweo/Lecture-Slide-Tutor.git
 cd Lecture-Slide-Tutor
-
-conda create -n SlideTutor python=3.11 -y
-conda activate SlideTutor
-pip install -r requirements.txt
-```
-
-Or use a standard virtual environment:
-
-```bash
-git clone https://github.com/Deepinsnoweo/Lecture-Slide-Tutor.git
-cd Lecture-Slide-Tutor
-
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### 2. Configure a model provider
+On Windows PowerShell, create the environment with `py -3.11 -m venv .venv` and activate it with `.\.venv\Scripts\Activate.ps1`. With Conda, run `conda create -n SlideTutor python=3.11` and `conda activate SlideTutor` in place of the virtual environment commands.
 
-Copy the example file:
+### 2. Connect a model API
+
+From the repository root, copy [.env.example](.env.example) to `.env`.
 
 ```bash
 cp .env.example .env
 ```
 
-Then set an OpenAI-compatible endpoint in `.env`:
+Choose one provider and edit the three active `SLIDE_TUTOR_*` lines in `.env`. On PowerShell, use `Copy-Item .env.example .env` to copy the template.
+
+| Variable | What to enter |
+| --- | --- |
+| `SLIDE_TUTOR_BASE_URL` | Your provider’s OpenAI-compatible API base URL. Keep any required `/v1` prefix and omit the `/chat/completions` suffix. |
+| `SLIDE_TUTOR_API_KEY` | An API key created in your provider’s API dashboard. |
+| `SLIDE_TUTOR_MODEL` | The exact Chat Completions model ID available to that API account. Quiz generation also needs JSON output support. |
+
+**DeepSeek**
+
+Create an API key in the [DeepSeek platform](https://platform.deepseek.com/api_keys) and replace the placeholder below. [DeepSeek model IDs](https://api-docs.deepseek.com/quick_start/pricing/)
 
 ```dotenv
-SLIDE_TUTOR_BASE_URL=https://your-provider.example/v1
-SLIDE_TUTOR_API_KEY=your-api-key
-SLIDE_TUTOR_MODEL=your-model-name
+SLIDE_TUTOR_BASE_URL=https://api.deepseek.com
+SLIDE_TUTOR_API_KEY=replace-with-your-deepseek-api-key
+SLIDE_TUTOR_MODEL=deepseek-flash
 ```
 
-For local Ollama:
+**OpenAI**
 
-```bash
-ollama pull llama3.2
+Create an API key in the [OpenAI platform](https://platform.openai.com/api-keys) and replace the placeholder below. [GPT-4o mini API support](https://developers.openai.com/api/docs/models/gpt-4o-mini)
+
+```dotenv
+SLIDE_TUTOR_BASE_URL=https://api.openai.com/v1
+SLIDE_TUTOR_API_KEY=replace-with-your-openai-api-key
+SLIDE_TUTOR_MODEL=gpt-4o-mini
 ```
+
+**Local Ollama**
+
+Start the Ollama app or run `ollama serve` in a separate terminal. Run `ollama pull llama3.2` and use the configuration below. The OpenAI-compatible client requires a key value, so use the placeholder `ollama`. [Ollama API compatibility](https://docs.ollama.com/api/openai-compatibility)
 
 ```dotenv
 SLIDE_TUTOR_BASE_URL=http://localhost:11434/v1
@@ -157,15 +153,29 @@ SLIDE_TUTOR_API_KEY=ollama
 SLIDE_TUTOR_MODEL=llama3.2
 ```
 
-Never commit `.env`; it is already ignored by Git.
+For other OpenAI-compatible providers, enter the base URL, key and model ID from their API docs. Keep your key in the ignored `.env` file. Restart SlideTutor after changing providers or keys.
 
-### 3. Start SlideTutor
+### 3. Start and check the connection
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501), create a project, and upload one or more PDFs.
+Open [http://localhost:8501](http://localhost:8501) and follow the first three steps below. A response from **Explain this page** confirms that the app can reach your model.
+
+| If you see | Check |
+| --- | --- |
+| `401 Unauthorized` | Check that you replaced the placeholder with a valid API key from the selected provider. |
+| `404` or model not found | Check the API base URL and the model ID available to your account. |
+| Connection refused for Ollama | Start the Ollama server and confirm that the model is installed with `ollama list`. |
+
+## First study session
+
+1. In **Browse slides**, enter a project name and click **Create project**. For a first run, choose one PDF from the [demo folder](demo/). To try a course-wide exam, upload all three PDFs from either demo course.
+2. Use **Upload** and **Add to project**. Open **PDFs** to switch files. Use the page number, arrow buttons or **View thumbnails** to find a slide.
+3. Pick an answer language and click **Explain this page**, **Translate this page**, or enter a question and click **Ask**. Check the file and page in the answer’s citations. The first request may build the project index.
+4. Choose **Take quiz**, select **Per-PDF quiz** or **Final exam**, and generate a set. Choose **Reviewed** under **Final exam** for an evidence-checked exam. Submit your answers, then use **Open in Browse** on a citation to return to the source slide.
+5. Open **Dashboard** to see weak topics and review priorities. Use **Back to quiz results** after following a citation from a quiz.
 
 ## Optional agent and parsing features
 
@@ -181,16 +191,6 @@ SLIDE_TUTOR_QA_AGENT_MAX_SECONDS=45
 
 The multilingual sentence-transformer and Marker parser are local-files-only by default. When their model files are unavailable, retrieval/parser paths degrade to lighter local fallbacks rather than blocking the basic application. To intentionally allow initial model downloads, review the privacy and storage implications and set the relevant `*_LOCAL_FILES_ONLY` variables in `.env` to `false`.
 
-## Using the application
-
-1. Create a project in the sidebar.
-2. Upload one or more text-based PDF lecture decks.
-3. Browse to a page and choose Explain, Translate, or Free Ask.
-4. Optionally build the enhanced project index for stronger page understanding and retrieval.
-5. Choose **Take quiz**, then select a per-PDF quiz or final exam and the desired quality mode.
-6. Submit answers to reveal grading, explanations, citations, and the weakness report.
-7. Use **Dashboard** and answer/quiz history to continue reviewing.
-
 ## Verification
 
 Run the complete local suite:
@@ -201,13 +201,13 @@ python -m compileall app.py slide_tutor tests
 python -m pytest tests/ -q
 ```
 
-Latest verification of this published snapshot at the time this README was prepared:
+Latest verification of the published version
 
 ```text
-305 passed, 1 skipped
+318 passed, 1 skipped
 ```
 
-The skipped test validates internal evaluation fixtures under `Docs/eval/`; those artifacts are intentionally excluded from the public snapshot. The complete local development repository passes all 306 tests.
+The skipped test requires internal evaluation fixtures under `Docs/eval/`.
 
 Tests mock external model/parser calls unless a command explicitly performs a live-provider evaluation. Live evaluations require your own credentials and should never persist API keys, full prompts, private slide text, or raw provider responses in the repository.
 
