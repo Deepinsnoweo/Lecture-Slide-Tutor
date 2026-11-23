@@ -34,6 +34,7 @@ from slide_tutor.models import (
     QuizResultDetail,
     QuizReuseSummary,
     ReviewedExamBundle,
+    ShortAnswerGradeBatch,
     QuizSet,
     WeaknessItem,
     WeaknessReport,
@@ -756,23 +757,23 @@ def grade_short_answers(
         max_retries=2,
         reasoning_effort="high",
     )
-    grades = result.get("grades", []) if isinstance(result, dict) else []
-    grades_by_id = {str(item.get("question_id", "")): item for item in grades}
+    try:
+        response = ShortAnswerGradeBatch.model_validate(result)
+    except ValueError as exc:
+        raise LLMError("Invalid short-answer grading response.") from exc
 
-    missing = [detail.question_id for detail in short_details if detail.question_id not in grades_by_id]
-    if missing:
-        raise LLMError(f"Short-answer grading missed question(s): {', '.join(missing)}")
+    grades = {grade.question_id: grade for grade in response.grades}
+    expected_ids = {detail.question_id for detail in short_details}
+    if grades.keys() != expected_ids or len(response.grades) != len(short_details):
+        raise LLMError("Short-answer grades must include exactly one score per question.")
+    if any(grades[detail.question_id].points_awarded > detail.max_points for detail in short_details):
+        raise LLMError("A short-answer grade exceeded the question's maximum score.")
 
     for detail in short_details:
-        raw_grade = grades_by_id[detail.question_id]
-        try:
-            points = float(raw_grade.get("points_awarded", 0))
-        except (TypeError, ValueError) as exc:
-            raise LLMError(f"Invalid short-answer score for {detail.question_id}.") from exc
-        points = max(0.0, min(points, detail.max_points))
-        detail.points_awarded = points
-        detail.is_correct = points >= 2.0
-        detail.grading_feedback = str(raw_grade.get("grading_feedback", "")).strip()
+        grade = grades[detail.question_id]
+        detail.points_awarded = grade.points_awarded
+        detail.is_correct = grade.points_awarded == detail.max_points
+        detail.grading_feedback = grade.grading_feedback.strip()
 
     return details
 
@@ -826,9 +827,7 @@ def batch_wrong_reasons(
 # ── Weakness Report ──
 
 
-def _rule_based_weakness_report(
-    quiz_set: QuizSet, details: list[QuizResultDetail],
-) -> WeaknessReport:
+def _rule_based_weakness_report(details: list[QuizResultDetail]) -> WeaknessReport:
     """Fallback: group wrong answers by topic_tag, list citations.  No LLM needed."""
     wrong_details = [d for d in details if not d.is_correct]
     correct_details = [d for d in details if d.is_correct]
@@ -955,7 +954,7 @@ def generate_weakness_report(
     facts_by_id = {fact.question_id: fact for fact in facts}
     wrong_details = [d for d in details if not d.is_correct]
     if not wrong_details:
-        return _rule_based_weakness_report(quiz_set, details)
+        return _rule_based_weakness_report(details)
 
     # Build quiz summary for the prompt
     summary_items = []
@@ -1017,7 +1016,7 @@ def generate_weakness_report(
     except Exception as exc:
         logger.warning("LLM Weakness Report failed, using rule-based fallback: %s", exc)
 
-    fallback = _rule_based_weakness_report(quiz_set, details)
+    fallback = _rule_based_weakness_report(details)
     fallback.quality_metadata["unsupported_claim_count"] = unsupported_count
     return fallback
 
@@ -1283,10 +1282,30 @@ def save_quiz_attempt(quiz_set: QuizSet, attempt: QuizAttempt, result: QuizResul
     cache.save_json(attempts_dir / f"{attempt.attempt_id}.json", record)
 
 
+def _read_quiz_attempt(path: Path) -> dict | None:
+    """Correct historical partial-credit classifications in memory."""
+    record = cache.load_json(path)
+    if not record:
+        return record
+    result = record.get("result") or {}
+    corrected = False
+    for detail in result.get("details", []):
+        points = detail.get("points_awarded")
+        maximum = detail.get("max_points")
+        if (detail.get("question_type") == "short_answer" and detail.get("is_correct")
+                and isinstance(points, (int, float)) and isinstance(maximum, (int, float))
+                and points < maximum):
+            detail["is_correct"] = False
+            corrected = True
+    if corrected and record.get("weakness_report"):
+        details = QuizResult.model_validate(result).details
+        record["weakness_report"] = _rule_based_weakness_report(details).model_dump(mode="json")
+    return record
+
+
 def load_quiz_attempt(project_id: str, attempt_id: str) -> dict | None:
     """Load a saved attempt record."""
-    path = _attempt_path(project_id, attempt_id)
-    return cache.load_json(path)
+    return _read_quiz_attempt(_attempt_path(project_id, attempt_id))
 
 
 def _quiz_set_has_attempts(project_id: str, quiz_set_id: str) -> bool:
@@ -1328,7 +1347,7 @@ def list_quiz_attempts(project_id: str, limit: int | None = 20) -> list[dict]:
         return []
     records: list[dict] = []
     for f in sorted(attempts_dir.glob("*.json"), reverse=True):
-        data = cache.load_json(f)
+        data = _read_quiz_attempt(f)
         if data:
             records.append(data)
         if limit is not None and len(records) >= limit:

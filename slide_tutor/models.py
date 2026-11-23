@@ -1193,6 +1193,16 @@ class FillBlankGradeBatch(BaseModel):
         return self
 
 
+class ShortAnswerGrade(BaseModel):
+    question_id: str = Field(min_length=1)
+    points_awarded: float = Field(strict=True, ge=0, allow_inf_nan=False)
+    grading_feedback: str = ""
+
+
+class ShortAnswerGradeBatch(BaseModel):
+    grades: list[ShortAnswerGrade]
+
+
 class TopicCatalogEntry(BaseModel):
     """Bounded planner input: titles and short summaries, never full page text."""
 

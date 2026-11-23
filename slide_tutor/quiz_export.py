@@ -3,8 +3,8 @@ QuizSet, QuizResult, and optional WeaknessReport."""
 
 from __future__ import annotations
 
-from slide_tutor.models import QuizResult, QuizResultDetail, QuizSet, WeaknessReport
-from slide_tutor.quiz_formatting import format_quiz_answer, question_by_id
+from slide_tutor.models import QuizResult, QuizSet, WeaknessReport
+from slide_tutor.quiz_formatting import format_quiz_answer, question_by_id, quiz_result_icon
 
 
 def _format_points(value: float | int | None) -> str:
@@ -81,7 +81,7 @@ def export_quiz_report_markdown(
         questions = question_by_id(quiz_set.questions) if quiz_set else {}
         lines.append("## Questions")
         for i, d in enumerate(result.details, start=1):
-            icon = "✅" if d.is_correct else ("⏳" if d.points_awarded is None else "❌")
+            icon = quiz_result_icon(d)
             qtype = getattr(d, "question_type", "mcq") or "mcq"
             lines.append(f"### {icon} Q{i} [{_question_type_label(qtype)}]: {d.question}")
             question = questions.get(d.question_id)

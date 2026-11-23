@@ -6,15 +6,21 @@ from slide_tutor.ui import (
     _agent_summary_text,
     _ensure_preview_preference_state,
     _ensure_qa_language_state,
+    _find_cited_file,
     _generation_lifecycle_label,
     _has_history_or_memory,
     _page_jump_key,
+    _page_browser_window_key,
+    _page_browser_window,
+    _page_browser_window_start,
     _persist_preview_preference,
     _persist_qa_language_state,
+    _pdf_reorder_options,
     _preview_image_data_uri,
     _preview_preference_key,
     _preview_state_key,
     _quiz_generation_quality_notice,
+    _select_pdf,
     _set_selected_page,
 )
 from slide_tutor.models import AgentRunSummary
@@ -80,6 +86,79 @@ def test_page_navigation_callbacks_commit_canonical_and_jump_state():
     state[jump_key] = 2
     _apply_page_jump(state, jump_key, 5)
     assert state["selected_page_number"] == 2
+
+
+def test_pdf_selection_resets_page_only_when_file_changes():
+    state = {
+        "selected_file_id": "file-a",
+        "selected_page_number": 12,
+        "qa_file_clear_confirmation": ("project-a", "file-a", frozenset({"answer-1"})),
+    }
+
+    _select_pdf(state, "file-a")
+    assert state["selected_page_number"] == 12
+    assert "qa_file_clear_confirmation" in state
+
+    _select_pdf(state, "file-b")
+    assert state["selected_file_id"] == "file-b"
+    assert state["selected_page_number"] == 1
+    assert "qa_file_clear_confirmation" not in state
+
+
+def test_citation_resolves_by_file_identity_and_rejects_ambiguous_legacy_names():
+    from types import SimpleNamespace
+
+    first = SimpleNamespace(file_id="first", original_name="lecture.pdf")
+    second = SimpleNamespace(file_id="second", original_name="lecture.pdf")
+    other = SimpleNamespace(file_id="other", original_name="other.pdf")
+    project = SimpleNamespace(project_id="project-a", files=[first, second, other])
+
+    assert _find_cited_file(project, "lecture.pdf", file_id="second") is second
+    assert _find_cited_file(project, "lecture.pdf", file_id="deleted") is None
+    assert _find_cited_file(project, "lecture.pdf", file_id="second", project_id="project-b") is None
+    assert _find_cited_file(project, "lecture.pdf") is None
+    assert _find_cited_file(project, "lecture") is None
+    assert _find_cited_file(project, " other.PDF ") is other
+
+
+def test_pdf_reorder_options_are_unique_and_do_not_expose_hashes():
+    class File:
+        def __init__(self, file_id: str, name: str, pages: int, sha256: str):
+            self.file_id = file_id
+            self.original_name = name
+            self.page_count = pages
+            self.sha256 = sha256
+
+    files = [
+        File("file-a", "lecture.pdf", 10, "secret-a"),
+        File("file-b", "lecture.pdf", 20, "secret-b"),
+    ]
+    labels, ids_by_label = _pdf_reorder_options(files)
+
+    assert labels == [
+        "1. lecture.pdf · 10 pages",
+        "2. lecture.pdf · 20 pages",
+    ]
+    assert [ids_by_label[label] for label in labels] == ["file-a", "file-b"]
+    assert all("secret" not in label for label in labels)
+
+
+def test_page_browser_window_is_bounded_and_handles_last_group():
+    slides = list(range(1, 54))
+
+    assert _page_browser_window_start(1, 53) == 1
+    assert _page_browser_window_start(13, 53) == 13
+    assert _page_browser_window_start(53, 53) == 49
+    assert _page_browser_window(slides, 1) == list(range(1, 13))
+    assert _page_browser_window(slides, 49) == list(range(49, 54))
+    assert len(_page_browser_window(slides, 13)) <= 12
+
+
+def test_page_browser_state_is_scoped_to_project_and_pdf():
+    project_a_file_a = _page_browser_window_key("project-a", "file-a")
+    assert project_a_file_a == _page_browser_window_key("project-a", "file-a")
+    assert project_a_file_a != _page_browser_window_key("project-a", "file-b")
+    assert project_a_file_a != _page_browser_window_key("project-b", "file-a")
 
 
 def test_qa_language_survives_widget_cleanup_and_remains_project_scoped():

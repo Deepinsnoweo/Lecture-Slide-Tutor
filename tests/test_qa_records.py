@@ -3,6 +3,7 @@ from __future__ import annotations
 from slide_tutor.models import AgentRunSummary, QAAnswerRecord, QAContextBundle, SlidePage
 from slide_tutor.qa_jobs import QAJobRequest, QAJobSnapshot
 from slide_tutor.qa_records import (
+    clear_file_answer_history,
     clear_project_answer_history,
     current_response_from_snapshot,
     delete_project_answer_record,
@@ -12,6 +13,23 @@ from slide_tutor.qa_records import (
     remove_answer_records,
     should_enter_memory,
 )
+
+
+def test_clear_file_history_preserves_answers_saved_after_confirmation(isolated_data_root):
+    def save(record_id: str, file_id: str) -> None:
+        persist_answer_record(_record(
+            record_id, action="ask", created_at="2026-07-13T01:00:00Z", file_id=file_id,
+        ))
+
+    save("confirmed", "file-a")
+    save("other-file", "file-b")
+    save("new-same-file", "file-a")
+    save("new-other-file", "file-b")
+    remaining = clear_file_answer_history("project-a", "file-a", frozenset({"confirmed"}))
+
+    expected_ids = {"other-file", "new-same-file", "new-other-file"}
+    assert {record.record_id for record in remaining} == expected_ids
+    assert {record.record_id for record in load_project_answer_history("project-a")} == expected_ids
 
 
 def _record(

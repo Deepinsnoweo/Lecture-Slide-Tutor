@@ -106,11 +106,25 @@ def persist_answer_record(record: QAAnswerRecord) -> list[QAAnswerRecord]:
 
 
 def delete_project_answer_record(project_id: str, record_id: str) -> list[QAAnswerRecord]:
-    records = [
-        record for record in load_project_answer_history(project_id)
-        if record.record_id != record_id
-    ]
-    return save_project_answer_history(project_id, records)
+    with _HISTORY_LOCK:
+        records = [
+            record for record in load_project_answer_history(project_id)
+            if record.record_id != record_id
+        ]
+        return save_project_answer_history(project_id, records)
+
+
+def clear_file_answer_history(
+    project_id: str, file_id: str, record_ids: frozenset[str],
+) -> list[QAAnswerRecord]:
+    """Delete the confirmed records from this file in the latest saved history."""
+    with _HISTORY_LOCK:
+        records = load_project_answer_history(project_id)
+        remaining = [
+            record for record in records
+            if record.file_id != file_id or record.record_id not in record_ids
+        ]
+        return save_project_answer_history(project_id, remaining)
 
 
 def clear_project_answer_history(project_id: str) -> list[QAAnswerRecord]:

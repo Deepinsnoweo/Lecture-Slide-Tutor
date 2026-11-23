@@ -48,6 +48,41 @@ def test_background_quiz_job_completes_and_terminal_is_claimed_once():
     assert registry.claim_terminal(snapshot.task_id) is None
 
 
+def test_quiz_page_does_not_claim_completed_job_in_another_project(
+    isolated_data_root, monkeypatch,
+):
+    from streamlit.testing.v1 import AppTest
+
+    from slide_tutor import ui
+    from slide_tutor.projects import create_project
+
+    other = create_project("Course B")
+    origin = create_project("Course A")
+    registry = QuizGenerationRegistry()
+    monkeypatch.setattr(ui, "quiz_generation_registry", registry)
+    app = AppTest.from_file("app.py").run()
+    app.sidebar.radio(key="app_mode_radio").set_value("Take quiz").run()
+    session_id = app.session_state["quiz_generation_session_id"]
+    request = _request().model_copy(update={
+        "session_id": session_id, "project_id": origin.project_id,
+    })
+    result = _result().model_copy(update={"project_id": origin.project_id})
+    job = registry.start(request, lambda _request: result)
+    registry._jobs[job.task_id].thread.join(timeout=5)
+    assert registry.snapshot(job.task_id).status == "completed"
+    app.session_state[f"quiz-generation-task-{origin.project_id}"] = job.task_id
+
+    app.sidebar.selectbox(key="project_picker_id").set_value(other.project_id).run()
+    assert not app.exception
+    assert "quiz_set" not in app.session_state
+    assert not registry.snapshot(job.task_id).terminal_claimed
+
+    app.sidebar.selectbox(key="project_picker_id").set_value(origin.project_id).run()
+    assert not app.exception
+    assert app.session_state["quiz_set"].project_id == origin.project_id
+    assert registry.snapshot(job.task_id).terminal_claimed
+
+
 def test_duplicate_active_signature_and_other_active_request_are_rejected():
     registry = QuizGenerationRegistry()
     release = Event()

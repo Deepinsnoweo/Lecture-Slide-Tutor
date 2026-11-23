@@ -58,7 +58,7 @@ def _citation_key(citation: dict[str, Any]) -> tuple[str, int, str]:
     except (TypeError, ValueError):
         page_number = 0
     return (
-        str(citation.get("source_file", "")),
+        str(citation.get("file_id") or citation.get("source_file", "")),
         page_number,
         str(citation.get("snippet_reference", ""))[:80],
     )

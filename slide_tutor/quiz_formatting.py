@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from slide_tutor.models import QuizQuestion
+from slide_tutor.models import QuizQuestion, QuizResultDetail
+
+
+def quiz_result_icon(detail: QuizResultDetail) -> str:
+    if detail.is_correct:
+        return "✅"
+    if detail.points_awarded is None:
+        return "⏳"
+    if 0 < detail.points_awarded < detail.max_points:
+        return "◐"
+    return "❌"
 
 
 def format_quiz_answer(question: QuizQuestion | None, answer: str | None) -> str:

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from slide_tutor import dashboard
@@ -44,6 +45,7 @@ def _detail(topic: str, is_correct: bool, source_file: str, page_number: int) ->
 
 
 def test_dashboard_splits_lesson_and_final_exam(monkeypatch):
+    monkeypatch.setattr(dashboard, "_today", lambda: datetime(2026, 7, 4, tzinfo=UTC))
     records = [
         _record(
             "a1", "per_pdf", ["f1"], 3, 6, "2026-07-01T10:00:00Z",
@@ -117,6 +119,7 @@ def test_dashboard_marks_single_attempt_low_confidence(monkeypatch):
 
 
 def test_dashboard_omits_perfect_lessons_from_needs_attention(monkeypatch):
+    monkeypatch.setattr(dashboard, "_today", lambda: datetime(2026, 7, 4, tzinfo=UTC))
     records = [
         _record(
             "a1", "per_pdf", ["f1"], 6, 6, "2026-07-01T10:00:00Z",
@@ -147,6 +150,7 @@ def test_dashboard_omits_perfect_lessons_from_needs_attention(monkeypatch):
 
 
 def test_dashboard_weakness_debt_and_mastery_recovery(monkeypatch):
+    monkeypatch.setattr(dashboard, "_today", lambda: datetime(2026, 7, 23, tzinfo=UTC))
     records = [
         _record("a1", "per_pdf", ["f1"], 0, 1, "2026-07-20T10:00:00Z", [_detail("regression", False, "L.pdf", 1)]),
         _record("a2", "per_pdf", ["f1"], 1, 1, "2026-07-21T10:00:00Z", [_detail("regression", True, "L.pdf", 1)]),

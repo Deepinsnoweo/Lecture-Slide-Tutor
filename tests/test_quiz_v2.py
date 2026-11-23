@@ -281,7 +281,7 @@ def test_score_quiz_and_grade_short_answers(monkeypatch):
     assert by_id["tf1"].is_correct is False
     assert by_id["fill1"].is_correct is True
     assert by_id["short1"].points_awarded == 2.5
-    assert by_id["short1"].is_correct is True
+    assert by_id["short1"].is_correct is False
     assert by_id["short1"].grading_feedback
 
 
@@ -293,3 +293,53 @@ def test_short_answer_grading_missing_grade_raises(monkeypatch):
 
     with pytest.raises(LLMError):
         quiz.grade_short_answers(quiz_set, details, "中文")
+
+
+@pytest.mark.parametrize("raw_grade", [
+    {"question_id": "short1"},
+    {"question_id": "short1", "points_awarded": True},
+    {"question_id": "short1", "points_awarded": float("nan")},
+    {"question_id": "short1", "points_awarded": 4},
+])
+def test_short_answer_rejects_invalid_score_without_saving(monkeypatch, isolated_data_root, raw_grade):
+    from slide_tutor.quiz_submission import submit_quiz_answers
+
+    quiz_set = _quiz_set([QuizQuestion.model_validate(_question("short1", "short_answer"))])
+    monkeypatch.setattr(quiz, "complete_json", lambda *args, **kwargs: {"grades": [raw_grade]})
+
+    with pytest.raises(LLMError):
+        submit_quiz_answers(quiz_set, {"short1": "A short answer."})
+    assert quiz.list_quiz_attempts(quiz_set.project_id) == []
+
+
+def test_saved_partial_credit_updates_history_and_dashboard(isolated_data_root, monkeypatch):
+    from datetime import UTC, datetime
+
+    from slide_tutor import cache, dashboard
+    from slide_tutor.models import QuizAttempt, QuizResult, WeaknessReport
+
+    quiz_set = _quiz_set([QuizQuestion.model_validate(_question("short1", "short_answer"))])
+    details = quiz.score_quiz(quiz_set, {"short1": "A partial answer."})
+    details[0].points_awarded = 2
+    details[0].is_correct = True
+    result = QuizResult(score=2, max_score=3, total=1, details=details)
+    attempt = QuizAttempt(
+        attempt_id="legacy-attempt", project_id=quiz_set.project_id, quiz_set_id=quiz_set.quiz_set_id,
+        file_ids=quiz_set.file_ids, total_count=1, answers={"short1": "A partial answer."},
+        submitted_at="2026-07-08T00:00:00Z",
+    )
+    quiz.save_quiz_attempt(quiz_set, attempt, result, WeaknessReport(report_kind="mastery"))
+
+    restored = quiz.load_quiz_attempt(quiz_set.project_id, attempt.attempt_id)
+    assert restored["result"]["details"][0]["is_correct"] is False
+    assert restored["weakness_report"]["report_kind"] == "weakness"
+    assert restored["result"]["score"] == 2
+    corrected = QuizResult.model_validate(restored["result"])
+    assert "◐ Q1" in export_quiz_report_markdown(quiz_set, corrected)
+
+    monkeypatch.setattr(dashboard, "_today", lambda: datetime(2026, 7, 9, tzinfo=UTC))
+    data = dashboard.build_dashboard_data(quiz_set.project_id)
+    assert data["weaknesses"][0]["topic"] == "topic"
+    assert data["mastered"] == []
+    path = cache.get_project_dir(quiz_set.project_id) / "quiz_attempts" / "legacy-attempt.json"
+    assert cache.load_json(path)["result"]["details"][0]["is_correct"] is True

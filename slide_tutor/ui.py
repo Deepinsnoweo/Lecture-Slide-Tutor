@@ -11,7 +11,7 @@ from streamlit_sortables import sort_items
 
 from slide_tutor import cache, config
 from slide_tutor.ingestion import IngestionError, add_uploads_to_project
-from slide_tutor.models import ProjectFile, ProjectManifest, SlidePage
+from slide_tutor.models import Citation, ProjectFile, ProjectManifest, QAAnswerRecord, SlidePage
 from slide_tutor.projects import (
     create_project,
     delete_project,
@@ -42,6 +42,7 @@ from slide_tutor.page_understanding import load_page_understanding
 from slide_tutor.qa_jobs import QAJobRequest, qa_job_registry
 from slide_tutor.qa_pipelines import run_qa_pipeline
 from slide_tutor.qa_records import (
+    clear_file_answer_history,
     current_response_from_snapshot,
     clear_project_answer_history,
     delete_project_answer_record,
@@ -50,8 +51,6 @@ from slide_tutor.qa_records import (
     migrate_legacy_answer_state,
     project_answer_records,
     persist_answer_record,
-    remove_answer_records,
-    save_project_answer_history,
     upsert_answer_record,
 )
 from slide_tutor.thumbnails import ensure_page_image
@@ -66,7 +65,7 @@ from slide_tutor.quiz import (
     load_quiz_attempt,
 )
 from slide_tutor.models import QuizSet
-from slide_tutor.quiz_formatting import format_quiz_answer, question_by_id
+from slide_tutor.quiz_formatting import format_quiz_answer, question_by_id, quiz_result_icon
 from slide_tutor.quiz_markdown import normalize_quiz_markdown, render_quiz_markdown
 from slide_tutor.quiz_quality import (
     PLANNER_PROMPT_VERSION,
@@ -308,18 +307,16 @@ def _ensure_selected_file(project: ProjectManifest) -> None:
     if current_project != project.project_id:
         st.session_state["selected_project_id"] = project.project_id
         st.session_state["selected_file_id"] = ready_files[0].file_id if ready_files else None
-        st.session_state["expanded_file_id"] = ready_files[0].file_id if ready_files else None
         st.session_state["selected_page_number"] = 1
+        st.session_state.pop("expanded_file_id", None)
         return
 
     if selected_file not in ready_ids:
         st.session_state["selected_file_id"] = ready_files[0].file_id if ready_files else None
-        st.session_state["expanded_file_id"] = ready_files[0].file_id if ready_files else None
         st.session_state["selected_page_number"] = 1
 
-    expanded_file = st.session_state.get("expanded_file_id")
-    if expanded_file is not None and expanded_file not in ready_ids:
-        st.session_state["expanded_file_id"] = st.session_state.get("selected_file_id")
+    # This key belonged to the removed eager thumbnail expander.
+    st.session_state.pop("expanded_file_id", None)
 
 
 def _selected_file(project: ProjectManifest) -> ProjectFile | None:
@@ -340,19 +337,30 @@ def _selected_slide(slides: list[SlidePage]) -> SlidePage | None:
     return slides[page_number - 1]
 
 
-def _find_cited_file(project: ProjectManifest, source_file: str) -> ProjectFile | None:
-    """Resolve an LLM citation filename to a project file with tolerant matching."""
+def _find_cited_file(
+    project: ProjectManifest,
+    source_file: str,
+    *,
+    file_id: str | None = None,
+    project_id: str | None = None,
+) -> ProjectFile | None:
+    """Resolve a citation by identity, or by an unambiguous legacy filename."""
+    if project_id and project_id != project.project_id:
+        return None
+    if file_id:
+        return next((file for file in project.files if file.file_id == file_id), None)
     src_lower = (source_file or "").strip().lower()
     if not src_lower:
         return None
-    for file in project.files:
-        if file.original_name.strip().lower() == src_lower:
-            return file
-    for file in project.files:
-        name_lower = file.original_name.strip().lower()
-        if src_lower in name_lower or name_lower in src_lower:
-            return file
-    return None
+    exact = [file for file in project.files if file.original_name.strip().lower() == src_lower]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    matches = [
+        file for file in project.files
+        if src_lower in file.original_name.strip().lower()
+        or file.original_name.strip().lower() in src_lower
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 _PROJECT_PICKER_KEY = "project_picker_id"
@@ -366,6 +374,7 @@ def _clear_project_scoped_state() -> None:
         "selected_page_number",
         "delete_confirm_file_id",
         "delete_confirm_project_id",
+        "qa_file_clear_confirmation",
         "qa_memory",
         "qa_last_answer",
         "qa_last_question",
@@ -409,7 +418,6 @@ def _consume_pending_browse_jump() -> None:
     st.session_state["app_mode"] = "browse"
     st.session_state["app_mode_radio"] = "Browse slides"
     st.session_state["selected_file_id"] = file_id
-    st.session_state["expanded_file_id"] = file_id
     st.session_state["selected_page_number"] = max(page_number, 1)
     if pending.get("return_to") == "quiz":
         st.session_state["_return_to_quiz_results"] = True
@@ -517,7 +525,133 @@ def _render_pdf_upload(project: ProjectManifest) -> ProjectManifest:
     return load_project(project.project_id)
 
 
-def _render_pdf_sorter(project: ProjectManifest) -> ProjectManifest:
+def _pdf_reorder_options(
+    files: list[ProjectFile],
+) -> tuple[list[str], dict[str, str]]:
+    """Build unique human-readable sorter labels without exposing file hashes."""
+    labels = [
+        f"{position}. {file.original_name} · {file.page_count} pages"
+        for position, file in enumerate(files, start=1)
+    ]
+    return labels, {
+        label: file.file_id for label, file in zip(labels, files, strict=True)
+    }
+
+
+@st.dialog("Reorder PDFs", width="small")
+def _render_pdf_reorder_dialog(project_id: str) -> None:
+    project = load_project(project_id)
+    files = ordered_files(project)
+    if len(files) < 2:
+        st.info("Add at least two PDFs to change their order.")
+        return
+
+    labels, ids_by_label = _pdf_reorder_options(files)
+    sorted_labels = sort_items(
+        labels,
+        header="Drag PDFs into the preferred order",
+        direction="vertical",
+        custom_style="""
+        .sortable-component, .sortable-container, .sortable-container-body {
+            background: transparent;
+            border: 0;
+            padding: 0;
+        }
+        .sortable-container-header {
+            color: #5f6368;
+            font-size: 0.85rem;
+            font-weight: 500;
+            padding: 0 0 8px 0;
+        }
+        .sortable-item {
+            background: #ffffff !important;
+            border: 1px solid #d9d9d9 !important;
+            border-radius: 4px !important;
+            box-shadow: none !important;
+            color: #202124 !important;
+            font-size: 0.86rem !important;
+            margin: 0 0 6px 0 !important;
+            padding: 9px 10px !important;
+            text-align: left !important;
+        }
+        """,
+        key=f"pdf-reorder-dialog-{project_id}",
+    )
+    sorted_ids = [
+        ids_by_label[label] for label in sorted_labels if label in ids_by_label
+    ]
+    save_col, cancel_col = st.columns(2)
+    with save_col:
+        if st.button(
+            "Save order",
+            type="primary",
+            use_container_width=True,
+            disabled=len(sorted_ids) != len(files),
+        ):
+            update_file_order(project_id, sorted_ids)
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+
+
+@st.dialog("Delete PDF", width="small")
+def _render_delete_pdf_dialog(project_id: str, file_id: str) -> None:
+    project = load_project(project_id)
+    file = next((item for item in project.files if item.file_id == file_id), None)
+    if file is None:
+        st.info("This PDF is no longer part of the project.")
+        return
+
+    st.warning(
+        f"Delete **{file.original_name}** and its generated page files? "
+        "The project index will become out of date."
+    )
+    delete_col, cancel_col = st.columns(2)
+    with delete_col:
+        if st.button(
+            "Delete PDF",
+            type="primary",
+            use_container_width=True,
+        ):
+            delete_project_file(project_id, file_id)
+            if st.session_state.get("selected_file_id") == file_id:
+                st.session_state.pop("selected_file_id", None)
+                st.session_state["selected_page_number"] = 1
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+
+
+def _render_pdf_file_menu(
+    project: ProjectManifest,
+    file: ProjectFile,
+    generation_label: str,
+) -> None:
+    with st.popover(
+        "⋮",
+        help=f"Manage {file.original_name}",
+        type="tertiary",
+        use_container_width=True,
+    ):
+        st.markdown("**File details**")
+        st.caption(file.original_name)
+        st.caption(f"{file.page_count} pages · {file.source_type.upper()}")
+        st.caption(f"Parsing status · {file.status}")
+        st.caption(f"Project generation · {generation_label}")
+        st.caption(f"SHA-256 · {file.sha256}")
+        if file.error_message:
+            st.error(file.error_message)
+        if st.button(
+            "Delete PDF",
+            key=f"open-delete-pdf-{project.project_id}-{file.file_id}",
+            use_container_width=True,
+        ):
+            _render_delete_pdf_dialog(project.project_id, file.file_id)
+
+
+def _render_pdf_manager(project: ProjectManifest) -> ProjectManifest:
     files = ordered_files(project)
     if not files:
         st.sidebar.subheader("PDFs")
@@ -546,13 +680,15 @@ def _render_pdf_sorter(project: ProjectManifest) -> ProjectManifest:
     elif preindex_status == "not_indexed":
         st.sidebar.caption("Not pre-indexed — Q&A will build a lazy index on first use")
 
+    generation_label = "Generation status unavailable"
     if preindex_status != "not_ready":
         from slide_tutor.generation import generation_state
         from slide_tutor.index_store import compute_source_signature
         generation = generation_state(
             project.project_id, compute_source_signature(project.project_id),
         )
-        st.sidebar.caption(_generation_lifecycle_label(generation.lifecycle_status))
+        generation_label = _generation_lifecycle_label(generation.lifecycle_status)
+        st.sidebar.caption(generation_label)
         if generation.page_status in {"missing", "stale"}:
             operation_label = "Refresh sources"
         elif generation.index_status in {"missing", "stale"}:
@@ -562,120 +698,76 @@ def _render_pdf_sorter(project: ProjectManifest) -> ProjectManifest:
         with st.sidebar:
             _render_preindex_job_fragment(project.project_id, total_pages, operation_label)
 
-    labels_by_id = {
-        file.file_id: f"{file.original_name} · {file.page_count}p · {file.file_id[:6]}"
-        for file in files
-    }
-    ids_by_label = {label: file_id for file_id, label in labels_by_id.items()}
-    labels = [labels_by_id[file.file_id] for file in files]
-
-    if len(files) > 1:
-        with st.sidebar:
-            sorted_labels = sort_items(
-                labels,
-                header="Drag to reorder PDFs",
-                direction="vertical",
-                custom_style="""
-                .sortable-component {
-                    background: transparent;
-                    border: 0;
-                    padding: 0;
-                    margin: 0 0 12px 0;
-                }
-                .sortable-container {
-                    background: transparent;
-                    border: 0;
-                    padding: 0;
-                }
-                .sortable-container-header {
-                    font-size: 0.875rem;
-                    font-weight: 600;
-                    color: #31333f;
-                    padding: 0 0 4px 0;
-                }
-                .sortable-container-body {
-                    background: transparent;
-                    border: 0;
-                    padding: 0;
-                }
-                .sortable-item {
-                    background: transparent !important;
-                    color: #31333f !important;
-                    border: 0 !important;
-                    box-shadow: none !important;
-                    border-radius: 0 !important;
-                    padding: 2px 0 !important;
-                    margin: 0 !important;
-                    font-size: 0.82rem !important;
-                    font-weight: 400 !important;
-                    text-align: left !important;
-                    line-height: 1.25 !important;
-                }
-                .sortable-item:hover {
-                    text-decoration: underline;
-                }
-                """,
-                key=f"pdf-order-{project.project_id}",
-            )
-    else:
-        sorted_labels = labels
-
-    sorted_ids = [ids_by_label[label] for label in sorted_labels if label in ids_by_label]
-    current_ids = [file.file_id for file in files]
-    if sorted_ids and sorted_ids != current_ids:
-        project = update_file_order(project.project_id, sorted_ids)
-        st.rerun()
-
-    st.sidebar.subheader("PDFs")
     selected_id = st.session_state.get("selected_file_id")
-    expanded_id = st.session_state.get("expanded_file_id")
-    confirm_key = "delete_confirm_file_id"
+    with st.sidebar.expander(
+        f"PDFs ({len(files)})",
+        expanded=False,
+        type="compact",
+        key=f"pdf-manager-{project.project_id}",
+    ):
+        st.html(
+            """
+            <style>
+            [class*="st-key-pdf-file-card-"]:has(
+                [class*="st-key-select-file-"]
+                button[data-testid="stBaseButton-tertiary"]
+            ) {
+                background: #ffffff;
+                border-color: #d7d9dc;
+                border-radius: 5px;
+            }
+            [class*="st-key-pdf-file-card-"]:has(
+                [class*="st-key-select-file-"]
+                button[data-testid="stBaseButton-secondary"]
+            ) {
+                background: #e3e5e8;
+                border-color: #858a91;
+            }
+            [class*="st-key-pdf-file-card-"]
+            [class*="st-key-select-file-"]
+            button[data-testid="stBaseButton-secondary"] {
+                background: transparent;
+                border-color: transparent;
+            }
+            [class*="st-key-pdf-file-card-"]
+            [data-testid="stButton"] button {
+                justify-content: flex-start;
+                text-align: left;
+            }
+            </style>
+            """
+        )
+        if len(files) > 1 and st.button(
+            "Reorder",
+            key=f"open-pdf-reorder-{project.project_id}",
+            use_container_width=True,
+        ):
+            _render_pdf_reorder_dialog(project.project_id)
 
-    for file in ordered_files(project):
-        status = "" if file.status == "ready" else f" · {file.status}"
-        label = f"{file.original_name} · {file.page_count} pages{status}"
-
-        # Render file button and delete button side by side
-        btn_col, del_col = st.sidebar.columns([10, 1])
-        with btn_col:
-            if st.button(
-                label,
-                key=f"select-file-{file.file_id}",
-                type="primary" if file.file_id == selected_id else "secondary",
-                use_container_width=True,
-                disabled=file.status != "ready",
+        for file in ordered_files(project):
+            status = "" if file.status == "ready" else f" · {file.status}"
+            label = f"{file.original_name} · {file.page_count} pages{status}"
+            with st.container(
+                border=True,
+                key=f"pdf-file-card-{file.file_id}",
             ):
-                if expanded_id == file.file_id:
-                    st.session_state["expanded_file_id"] = None
-                    st.session_state["selected_file_id"] = file.file_id
-                else:
-                    if selected_id != file.file_id:
-                        st.session_state["selected_page_number"] = 1
-                    st.session_state["selected_file_id"] = file.file_id
-                    st.session_state["expanded_file_id"] = file.file_id
-                st.rerun()
-        with del_col:
-            if st.button("✕", key=f"delete-file-{file.file_id}", help="Delete this PDF"):
-                st.session_state[confirm_key] = file.file_id
-                st.rerun()
-
-        # Two-step confirmation for file deletion
-        if st.session_state.get(confirm_key) == file.file_id:
-            st.sidebar.warning(f"Delete **{file.original_name}**?")
-            cf_col, cc_col = st.sidebar.columns(2)
-            with cf_col:
-                if st.button("Yes", key=f"confirm-delete-file-{file.file_id}", type="primary", use_container_width=True):
-                    project = delete_project_file(project.project_id, file.file_id)
-                    st.session_state.pop(confirm_key, None)
-                    # Let _ensure_selected_file fix stale selected/expanded file IDs
-                    st.rerun()
-            with cc_col:
-                if st.button("No", key=f"cancel-delete-file-{file.file_id}", use_container_width=True):
-                    st.session_state.pop(confirm_key, None)
-                    st.rerun()
-
-        if file.file_id == st.session_state.get("expanded_file_id") and file.status == "ready":
-            _render_page_picker(project.project_id, file, load_file_slides(project.project_id, file.file_id))
+                file_col, menu_col = st.columns([8, 1], vertical_alignment="center")
+                with file_col:
+                    st.button(
+                        label,
+                        key=f"select-file-{file.file_id}",
+                        type=(
+                            "secondary"
+                            if file.file_id == selected_id
+                            else "tertiary"
+                        ),
+                        use_container_width=True,
+                        disabled=file.status != "ready",
+                        on_click=_select_pdf,
+                        args=(st.session_state, file.file_id),
+                    )
+                with menu_col:
+                    _render_pdf_file_menu(project, file, generation_label)
 
     return project
 
@@ -707,23 +799,13 @@ def _render_delete_project(project: ProjectManifest) -> None:
             st.rerun()
 
 
-def _render_page_picker(project_id: str, file: ProjectFile, slides: list[SlidePage]) -> None:
-    if not slides:
+def _select_pdf(state, file_id: str) -> None:
+    """Select a PDF without resetting the current page on a repeated click."""
+    if state.get("selected_file_id") == file_id:
         return
-
-    jump_key = _page_jump_key(file.file_id)
-    for slide in slides:
-        thumb_path = _resolve_file_path(project_id, file.file_id, slide.thumbnail_path)
-        if thumb_path and thumb_path.exists():
-            st.sidebar.image(str(thumb_path), width=120)
-        label = f"Page {slide.page_number} · {_quality_label(slide)}"
-        st.sidebar.button(
-            label,
-            key=f"select-page-{file.file_id}-{slide.page_number}",
-            use_container_width=True,
-            on_click=_set_selected_page,
-            args=(st.session_state, slide.page_number, len(slides), jump_key),
-        )
+    state["selected_file_id"] = file_id
+    state["selected_page_number"] = 1
+    state.pop("qa_file_clear_confirmation", None)
 
 
 def _page_jump_key(file_id: str) -> str:
@@ -744,6 +826,176 @@ def _apply_page_jump(state, jump_key: str, total_pages: int) -> None:
     _set_selected_page(
         state, int(state.get(jump_key, 1)), total_pages, jump_key,
     )
+
+
+_PAGE_BROWSER_WINDOW_SIZE = 12
+
+
+def _page_browser_window_key(project_id: str, file_id: str) -> str:
+    return f"page-browser-start-{project_id}-{file_id}"
+
+
+def _page_browser_window_start(
+    page_number: int,
+    total_pages: int,
+    window_size: int = _PAGE_BROWSER_WINDOW_SIZE,
+) -> int:
+    total_pages = max(int(total_pages), 1)
+    window_size = max(int(window_size), 1)
+    page_number = min(max(int(page_number), 1), total_pages)
+    return ((page_number - 1) // window_size) * window_size + 1
+
+
+def _page_browser_window(
+    slides: list[SlidePage],
+    start_page: int,
+    window_size: int = _PAGE_BROWSER_WINDOW_SIZE,
+) -> list[SlidePage]:
+    if not slides:
+        return []
+    start_index = min(max(int(start_page) - 1, 0), len(slides) - 1)
+    return slides[start_index:start_index + max(int(window_size), 1)]
+
+
+def _set_page_browser_window(state, start_key: str, start_page: int) -> None:
+    state[start_key] = max(int(start_page), 1)
+
+
+def _prepare_page_browser(
+    state,
+    project_id: str,
+    file_id: str,
+    current_page: int,
+    total_pages: int,
+) -> None:
+    start_key = _page_browser_window_key(project_id, file_id)
+    current_page = min(max(int(current_page), 1), max(int(total_pages), 1))
+    state[start_key] = _page_browser_window_start(current_page, total_pages)
+
+
+@st.dialog("Page thumbnails", width="large")
+def _render_page_browser_dialog(project_id: str, file_id: str) -> None:
+    project = load_project(project_id)
+    file = next((item for item in project.files if item.file_id == file_id), None)
+    if file is None or file.status != "ready":
+        st.info("This PDF is no longer available.")
+        return
+
+    slides = load_file_slides(project_id, file_id)
+    if not slides:
+        st.info("No pages are available for this PDF.")
+        return
+
+    total_pages = len(slides)
+    start_key = _page_browser_window_key(project_id, file_id)
+    current_page = min(
+        max(int(st.session_state.get("selected_page_number", 1)), 1),
+        total_pages,
+    )
+    if start_key not in st.session_state:
+        _prepare_page_browser(
+            st.session_state,
+            project_id,
+            file_id,
+            current_page,
+            total_pages,
+        )
+
+    start_page = _page_browser_window_start(
+        int(st.session_state.get(start_key, current_page)),
+        total_pages,
+    )
+    st.session_state[start_key] = start_page
+    end_page = min(start_page + _PAGE_BROWSER_WINDOW_SIZE - 1, total_pages)
+
+    st.caption(f"{file.original_name} · Pages {start_page}–{end_page} of {total_pages}")
+    previous_col, next_col = st.columns(2)
+    with previous_col:
+        st.button(
+            "Previous group",
+            disabled=start_page <= 1,
+            use_container_width=True,
+            on_click=_set_page_browser_window,
+            args=(
+                st.session_state,
+                start_key,
+                max(start_page - _PAGE_BROWSER_WINDOW_SIZE, 1),
+            ),
+        )
+    with next_col:
+        st.button(
+            "Next group",
+            disabled=end_page >= total_pages,
+            use_container_width=True,
+            on_click=_set_page_browser_window,
+            args=(
+                st.session_state,
+                start_key,
+                min(start_page + _PAGE_BROWSER_WINDOW_SIZE, total_pages),
+            ),
+        )
+
+    window = _page_browser_window(slides, start_page)
+    for row_start in range(0, len(window), 4):
+        columns = st.columns(4)
+        for column, slide in zip(columns, window[row_start:row_start + 4]):
+            with column:
+                thumb_path = _resolve_file_path(
+                    project_id,
+                    file_id,
+                    slide.thumbnail_path,
+                )
+                if thumb_path and thumb_path.exists():
+                    st.image(str(thumb_path), width="stretch")
+                else:
+                    st.caption("Preview unavailable")
+                if st.button(
+                    f"Page {slide.page_number}",
+                    key=f"browse-page-{project_id}-{file_id}-{slide.page_number}",
+                    type=(
+                        "secondary"
+                        if slide.page_number == current_page
+                        else "tertiary"
+                    ),
+                    use_container_width=True,
+                ):
+                    _set_selected_page(
+                        st.session_state,
+                        slide.page_number,
+                        total_pages,
+                        _page_jump_key(file_id),
+                    )
+                    st.rerun(scope="app")
+
+
+def _render_sidebar_page_navigation(
+    project_id: str,
+    file: ProjectFile,
+    slides: list[SlidePage],
+) -> None:
+    total_pages = len(slides)
+    if total_pages < 1:
+        return
+
+    current_page = min(
+        max(int(st.session_state.get("selected_page_number", 1)), 1),
+        total_pages,
+    )
+    st.sidebar.markdown(f"**{file.original_name}**")
+    st.sidebar.caption(f"Page {current_page} / {total_pages}")
+    if st.sidebar.button(
+        "View thumbnails",
+        key=f"open-page-browser-{project_id}-{file.file_id}",
+        use_container_width=True,
+    ):
+        _prepare_page_browser(
+            st.session_state,
+            project_id,
+            file.file_id,
+            current_page,
+            total_pages,
+        )
+        _render_page_browser_dialog(project_id, file.file_id)
 
 
 def _render_navigation(file: ProjectFile, total_pages: int) -> None:
@@ -1183,14 +1435,19 @@ def _render_qa_job_fragment(session_id: str, project_id: str) -> None:
         st.rerun(scope="app")
 
 
+def _sync_project_answer_records(project_id: str, saved: list[QAAnswerRecord]) -> None:
+    records = st.session_state.get("qa_answer_records", [])
+    st.session_state["qa_answer_records"] = [
+        *[record for record in records if record.project_id != project_id], *saved,
+    ]
+
+
 def _delete_answer_record(record_id: str) -> None:
     records = st.session_state.get("qa_answer_records", [])
     record = next((item for item in records if item.record_id == record_id), None)
     if record is not None:
-        delete_project_answer_record(record.project_id, record_id)
-    st.session_state["qa_answer_records"] = [
-        item for item in records if item.record_id != record_id
-    ]
+        saved = delete_project_answer_record(record.project_id, record_id)
+        _sync_project_answer_records(record.project_id, saved)
     st.rerun()
 
 
@@ -1227,6 +1484,12 @@ def _render_answer_history(
     busy: bool = False,
 ) -> None:
     records = st.session_state.get("qa_answer_records", [])
+    confirm_key = "qa_file_clear_confirmation"
+    confirm_scope = (project_id, current_file_id)
+    pending_clear = st.session_state.get(confirm_key)
+    if pending_clear and pending_clear[:2] != confirm_scope:
+        st.session_state.pop(confirm_key, None)
+        pending_clear = None
     scope_options = ["Current page", "Current PDF"]
     scope_map = {
         "Current page": "current_page",
@@ -1251,42 +1514,39 @@ def _render_answer_history(
     if projection.project_record_count == 0:
         return
 
-    file_count = sum(
-        record.project_id == project_id and record.file_id == current_file_id
-        for record in records
+    file_record_ids = frozenset(
+        record.record_id for record in records
+        if record.project_id == project_id and record.file_id == current_file_id
     )
     toolbar = st.columns([1, 4], vertical_alignment="center")
     with toolbar[0]:
         with st.popover("Manage answers", use_container_width=True):
             if st.button(
-                f"Clear current PDF ({file_count})", key=f"clear-file-answers-{project_id}",
-                disabled=busy or file_count == 0, use_container_width=True,
+                f"Clear current PDF ({len(file_record_ids)})", key=f"clear-file-answers-{project_id}",
+                disabled=busy or not file_record_ids, use_container_width=True,
             ):
-                st.session_state[f"confirm-clear-file-answers-{project_id}"] = True
+                pending_clear = (*confirm_scope, file_record_ids)
+                st.session_state[confirm_key] = pending_clear
     with toolbar[1]:
         st.radio(
             "Answer range", scope_options, horizontal=True, key=scope_key,
             label_visibility="collapsed",
         )
 
-    for delete_scope, label, count in (("current_file", "current PDF", file_count),):
-        confirm_key = f"confirm-clear-file-answers-{project_id}"
-        if not st.session_state.get(confirm_key):
-            continue
-        st.warning(f"Clear {count} answer record(s) from the {label}? Memory and Current response stay intact.")
+    if pending_clear:
+        _, confirmed_file_id, confirmed_ids = pending_clear
+        st.warning(f"Clear {len(confirmed_ids)} saved answer record(s) from the current PDF?")
         confirm_cols = st.columns(2)
         with confirm_cols[0]:
-            if st.button("Confirm clear", key=f"confirm-{delete_scope}-{project_id}", use_container_width=True):
-                updated_records = remove_answer_records(
-                    records, project_id=project_id, scope=delete_scope,
-                    current_file_id=current_file_id,
-                )
-                save_project_answer_history(project_id, updated_records)
-                st.session_state["qa_answer_records"] = updated_records
+            if st.button("Confirm clear", key=f"confirm-current_file-{project_id}-{confirmed_file_id}",
+                         disabled=busy, use_container_width=True):
+                saved = clear_file_answer_history(project_id, confirmed_file_id, confirmed_ids)
+                _sync_project_answer_records(project_id, saved)
                 st.session_state.pop(confirm_key, None)
                 st.rerun()
         with confirm_cols[1]:
-            if st.button("Cancel", key=f"cancel-{delete_scope}-{project_id}", use_container_width=True):
+            if st.button("Cancel", key=f"cancel-current_file-{project_id}-{confirmed_file_id}",
+                         use_container_width=True):
                 st.session_state.pop(confirm_key, None)
                 st.rerun()
     if not projection.groups:
@@ -1687,12 +1947,20 @@ def _render_quiz_history(project: ProjectManifest) -> None:
 
 
 @st.fragment(run_every=0.5)
-def _render_quiz_generation_fragment(session_id: str) -> None:
-    task_id = st.session_state.get("quiz_generation_task_id")
+def _render_quiz_generation_fragment(
+    project_id: str, session_id: str, *, waiting_for_other_project: bool,
+) -> None:
+    if waiting_for_other_project and quiz_generation_registry.active_snapshot(session_id) is None:
+        st.rerun(scope="app")
+    task_key = f"quiz-generation-task-{project_id}"
+    error_key = f"quiz-generation-error-{project_id}"
+    if task_key not in st.session_state:
+        task_key = "quiz_generation_task_id"  # In-flight job from before a reload.
+    task_id = st.session_state.get(task_key)
     if not task_id:
         return
     snapshot = quiz_generation_registry.snapshot(task_id)
-    if snapshot is None:
+    if snapshot is None or snapshot.project_id != project_id:
         return
     label = "Final exam" if snapshot.quiz_type == "final_exam" else "Quiz"
     if snapshot.status in {"pending", "running"}:
@@ -1714,18 +1982,19 @@ def _render_quiz_generation_fragment(session_id: str) -> None:
     terminal = quiz_generation_registry.claim_terminal(task_id)
     if terminal is None:
         return
-    st.session_state.pop("quiz_generation_task_id", None)
-    if terminal.status == "completed" and terminal.result is not None:
+    st.session_state.pop(task_key, None)
+    if (terminal.status == "completed" and terminal.result is not None
+            and terminal.result.project_id == project_id):
         _clear_quiz_session_state()
         st.session_state["quiz_set"] = terminal.result
         st.session_state["quiz_answers"] = {}
         st.session_state["quiz_submitted"] = False
         st.session_state["active_quiz_type"] = terminal.quiz_type
-        st.session_state.pop("quiz_generation_error", None)
+        st.session_state.pop(error_key, None)
     elif terminal.status == "cancelled":
-        st.session_state["quiz_generation_error"] = "Quiz generation cancelled. No cache was activated."
+        st.session_state[error_key] = "Quiz generation cancelled. No cache was activated."
     else:
-        st.session_state["quiz_generation_error"] = terminal.error or "Quiz generation failed"
+        st.session_state[error_key] = terminal.error or "Quiz generation failed"
     st.rerun(scope="app")
 
 
@@ -1743,12 +2012,16 @@ def _render_quiz_sidebar(project: ProjectManifest) -> None:
         st.sidebar.warning(quality_notice)
     st.session_state.setdefault("quiz_generation_session_id", f"quiz-session-{uuid4().hex}")
     session_id = st.session_state["quiz_generation_session_id"]
-    with st.sidebar:
-        _render_quiz_generation_fragment(session_id)
+    error_key = f"quiz-generation-error-{project.project_id}"
     active = quiz_generation_registry.active_snapshot(session_id)
+    with st.sidebar:
+        _render_quiz_generation_fragment(
+            project.project_id, session_id,
+            waiting_for_other_project=active is not None and active.project_id != project.project_id,
+        )
     busy = active is not None
 
-    error = st.session_state.get("quiz_generation_error")
+    error = st.session_state.get(error_key)
     if error:
         st.sidebar.error(error)
 
@@ -1847,10 +2120,10 @@ def _render_quiz_sidebar(project: ProjectManifest) -> None:
         try:
             snapshot = quiz_generation_registry.start(request)
         except RuntimeError as exc:
-            st.session_state["quiz_generation_error"] = str(exc)
+            st.session_state[error_key] = str(exc)
         else:
-            st.session_state["quiz_generation_task_id"] = snapshot.task_id
-            st.session_state.pop("quiz_generation_error", None)
+            st.session_state[f"quiz-generation-task-{project.project_id}"] = snapshot.task_id
+            st.session_state.pop(error_key, None)
         st.rerun()
 
     _render_quiz_history(project)
@@ -1860,9 +2133,12 @@ def _render_quiz_sidebar(project: ProjectManifest) -> None:
 
 
 @st.fragment(run_every=0.5)
-def _render_quiz_main_generation_fragment(session_id: str) -> None:
+def _render_quiz_main_generation_fragment(session_id: str, project_id: str) -> None:
     active = quiz_generation_registry.active_snapshot(session_id)
     if active is None:
+        return
+    if active.project_id != project_id:
+        st.info("A quiz is generating in another project. Switch back to view its progress.")
         return
     label = "Reviewed Final Exam" if active.quality_mode == "reviewed" else (
         "Fast Final Exam" if active.quiz_type == "final_exam" else "Fast Quiz"
@@ -1898,10 +2174,11 @@ def _render_quiz_main(project: ProjectManifest) -> None:
     session_id = st.session_state.get("quiz_generation_session_id", "")
     active = quiz_generation_registry.active_snapshot(session_id) if session_id else None
     if active is not None:
-        _render_quiz_main_generation_fragment(session_id)
-        return
+        _render_quiz_main_generation_fragment(session_id, project.project_id)
+        if active.project_id == project.project_id:
+            return
     quiz_set: QuizSet | None = st.session_state.get("quiz_set")
-    if quiz_set is None:
+    if quiz_set is None or quiz_set.project_id != project.project_id:
         st.info("Select quiz options in the sidebar and click Generate.")
         return
 
@@ -2071,7 +2348,7 @@ def _render_quiz_results(quiz_set: QuizSet, project: ProjectManifest) -> None:
     # Per-question feedback
     questions = question_by_id(quiz_set.questions)
     for i, d in enumerate(details, start=1):
-        icon = "✅" if d.is_correct else ("⏳" if d.points_awarded is None else "❌")
+        icon = quiz_result_icon(d)
         question_preview = d.question[:80] + "..." if len(d.question) > 80 else d.question
         qtype = getattr(d, "question_type", "mcq") or "mcq"
         type_label = _QUESTION_TYPE_DISPLAY.get(qtype, qtype)
@@ -2147,15 +2424,17 @@ def _render_cited_page_preview(project: ProjectManifest, file: ProjectFile,
                 st.warning("Page image is missing from the project cache.")
 
 
-def _render_citation_review(citation, project: ProjectManifest, key_suffix: str) -> None:
+def _render_citation_review(citation: Citation, project: ProjectManifest, key_suffix: str) -> None:
     """Render an inline cited-page preview plus a stable Browse jump action."""
     source_file = citation.source_file
     page_num = citation.page_number
     st.caption(f"📖 {source_file}, page {page_num}")
 
-    file = _find_cited_file(project, source_file)
+    file = _find_cited_file(
+        project, source_file, file_id=citation.file_id, project_id=citation.project_id,
+    )
     if file is None:
-        st.warning("The cited PDF is no longer available in this project.")
+        st.warning("The cited PDF could not be uniquely located in this project.")
         return
 
     _render_cited_page_preview(project, file, page_num)
@@ -2316,9 +2595,11 @@ def _render_review_link_from_citation(citation: dict, project: ProjectManifest,
     except (TypeError, ValueError):
         page_num = 0
 
-    file = _find_cited_file(project, source_file)
+    file = _find_cited_file(
+        project, source_file, file_id=citation.get("file_id"), project_id=citation.get("project_id"),
+    )
     if file is None:
-        st.warning("The cited PDF is no longer available in this project.")
+        st.warning("The cited PDF could not be uniquely located in this project.")
         return
 
     _render_cited_page_preview(project, file, page_num)
@@ -2398,7 +2679,7 @@ def render_app() -> None:
 
     project = _render_pdf_upload(project)
     _ensure_selected_file(project)
-    project = _render_pdf_sorter(project)
+    project = _render_pdf_manager(project)
     _ensure_selected_file(project)
 
     file = _selected_file(project)
@@ -2421,6 +2702,7 @@ def render_app() -> None:
         project.project_id, file.file_id, slide.page_number,
     )
 
+    _render_sidebar_page_navigation(project.project_id, file, slides)
     _render_navigation(file, len(slides))
     _render_selected_slide(project.project_id, file, slide)
 
